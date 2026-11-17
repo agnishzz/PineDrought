@@ -1,0 +1,405 @@
+# =============================================================================
+# Model 1a: Observed Scots pine mortality ~ climate anomalies
+# Pooled dataset (Spain + Switzerland), Site as random intercept
+# Family: ordered beta (glmmTMB::ordbeta), handles exact 0 and 1 directly
+#
+# Steps
+#   1. Data preparation
+#   2. Window selection (GP vs SS) using single-predictor models
+#   3. Predictor screening within the chosen window (LRT vs null)
+#   4. Global model and all admissible subsets (|r| <= 0.7 constraint)
+#   5. Residual diagnostics on candidate models (DHARMa, VIF, singularity)
+#   6. Final model selection and export
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(glmmTMB)
+  library(MuMIn)
+  library(DHARMa)
+  library(performance)
+})
+
+if (packageVersion("glmmTMB") < "1.1.8") stop("glmmTMB >= 1.1.8 required for ordbeta()")
+
+# ---- 0. Settings -------------------------------------------------------------
+in_file   <- "C:/Users/kumar_das/OneDrive - CZU v Praze/R_etal/PineDrought/Climate/ObsMor_anomaly.xlsx"
+out_dir   <- "C:/Users/kumar_das/OneDrive - CZU v Praze/R_etal/PineDrought/Models/M1b_Sim_Pooled"
+response  <- "SimMor"
+model_tag <- "M1a_Sim_Pooled_(A)"
+use_site_re <- TRUE          # set FALSE for Switzerland-only scripts
+
+p_screen   <- 0.10           # LRT threshold for screening
+r_max      <- 0.70           # max |r| between predictors in one model
+delta_cand <- 4              # dAICc range of candidates sent to diagnostics
+max_cand   <- 10             # max number of candidates diagnosed
+delta_pref <- 2              # among passing models within this dAICc, prefer fewest terms
+alpha_diag <- 0.05           # diagnostic test threshold
+n_sim      <- 1000           # DHARMa simulations
+obs_per_term <- 10           # cap: one predictor per 10 observations
+
+set.seed(123)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+base_vars <- c("VPD", "Prec", "Eto",
+               "CWB", "WDcount", "SDII", "CDD") #"MaxTemp", "MinTemp", 
+windows   <- c(GP = "_GP", SS = "_SS")   # YL_ = year-lagged prefix
+var_name  <- function(base, w) paste0("YL_", base, windows[[w]])
+base_of   <- function(v) sub("_(WY|GP|SS)$", "", sub("^YL_", "", v))
+all_vars  <- unlist(lapply(names(windows), function(w) var_name(base_vars, w)))
+
+# ---- 1. Data -----------------------------------------------------------------
+raw <- read_excel(in_file)
+
+dat <- raw %>%
+  mutate(y = .data[[response]] / 100,
+         Site = factor(Site)) %>%
+  select(Site, Country, Year, y, all_of(all_vars)) %>%
+  filter(if_all(c(y, all_of(all_vars)), ~ !is.na(.x))) %>%
+  arrange(Site, Year) %>%
+  mutate(across(all_of(all_vars), ~ as.numeric(scale(.x)))) %>%
+  as.data.frame()
+
+stopifnot(all(dat$y >= 0 & dat$y <= 1))
+
+cat("\n==== DATA ====\n")
+cat("Observations:", nrow(dat), "\n")
+print(dat %>% group_by(Site) %>%
+        summarise(n = n(), years = paste(range(Year), collapse = "-"),
+                  zeros = sum(y == 0), mean_pct = round(mean(y) * 100, 2),
+                  max_pct = round(max(y) * 100, 2), .groups = "drop"))
+
+# ---- Helpers -----------------------------------------------------------------
+rand_part <- if (use_site_re) " + (1 | Site)" else ""
+
+make_fml <- function(vars) {
+  rhs <- if (length(vars)) paste(vars, collapse = " + ") else "1"
+  as.formula(paste0("y ~ ", rhs, rand_part))
+}
+
+fit_ob <- function(vars) {
+  tryCatch(
+    suppressWarnings(glmmTMB(make_fml(vars), data = dat, family = ordbeta())),
+    error = function(e) NULL
+  )
+}
+
+is_ok <- function(m) {
+  !is.null(m) && m$fit$convergence == 0 && isTRUE(m$sdr$pdHess)
+}
+
+get_aicc <- function(m) if (is_ok(m)) AICc(m) else NA_real_
+
+# Nakagawa R2 (marginal = fixed effects, conditional = fixed + Site);
+# for models without random effects the single R2 goes to R2_marginal
+get_r2 <- function(m) {
+  r <- tryCatch(suppressWarnings(performance::r2(m)), error = function(e) NULL)
+  if (is.null(r)) return(tibble(R2_marginal = NA_real_, R2_conditional = NA_real_))
+  num <- function(x) if (is.null(x) || length(x) == 0) NA_real_ else as.numeric(x[1])
+  tibble(R2_marginal    = if (!is.null(r$R2_marginal)) num(r$R2_marginal) else num(r[[1]]),
+         R2_conditional = num(r$R2_conditional))
+}
+
+# ---- 2. Window selection -----------------------------------------------------
+m_null <- fit_ob(character(0))
+if (!is_ok(m_null)) stop("Null model failed to converge")
+aicc_null <- AICc(m_null)
+
+single_grid <- expand_grid(window = names(windows), base = base_vars) %>%
+  mutate(var = map2_chr(base, window, var_name))
+
+single_models <- map(single_grid$var, fit_ob)
+names(single_models) <- single_grid$var
+
+single_tab <- single_grid %>%
+  mutate(converged  = map_lgl(single_models, is_ok),
+         AICc       = map_dbl(single_models, get_aicc),
+         estimate   = map2_dbl(single_models, var,
+                               ~ if (is_ok(.x)) fixef(.x)$cond[[.y]] else NA_real_),
+         dAICc_null = AICc - aicc_null)
+
+all_aicc <- c(null = aicc_null, setNames(single_tab$AICc, single_tab$var))
+w_raw    <- exp(-0.5 * (all_aicc - min(all_aicc, na.rm = TRUE)))
+w_all    <- w_raw / sum(w_raw, na.rm = TRUE)
+single_tab$weight <- unname(w_all[single_tab$var])
+
+window_tab <- single_tab %>%
+  group_by(window) %>%
+  summarise(best_var        = var[which.min(AICc)],
+            best_AICc       = min(AICc, na.rm = TRUE),
+            best_dAICc_null = best_AICc - aicc_null,
+            n_improve_2     = sum(dAICc_null < -2, na.rm = TRUE),
+            cum_weight      = sum(weight, na.rm = TRUE),
+            n_failed        = sum(!converged),
+            .groups = "drop") %>%
+  arrange(best_AICc)
+
+cat("\n==== WINDOW SELECTION ====\n")
+cat("Null model AICc:", round(aicc_null, 2), "\n")
+print(window_tab)
+
+chosen_window <- window_tab$window[1]
+# chosen_window <- "SS"   # manual override if justified
+cat("Chosen window:", chosen_window, "\n")
+
+# ---- 3. Predictor screening --------------------------------------------------
+lrt_p <- function(m) {
+  a <- anova(m_null, m)
+  a[["Pr(>Chisq)"]][2]
+}
+
+screen_tab <- single_tab %>%
+  filter(window == chosen_window) %>%
+  mutate(LRT_p    = map_dbl(var, ~ if (is_ok(single_models[[.x]]))
+                                     lrt_p(single_models[[.x]]) else NA_real_),
+         retained = !is.na(LRT_p) & LRT_p < p_screen) %>%
+  arrange(LRT_p)
+
+cat("\n==== SCREENING (LRT vs null, p <", p_screen, ") ====\n")
+print(screen_tab %>% select(var, estimate, AICc, dAICc_null, LRT_p, retained))
+
+sel_vars <- screen_tab$var[screen_tab$retained]
+if (length(sel_vars) == 0) {
+  stop("No predictor passed screening in window ", chosen_window,
+       ". Consider reporting the null result or revisiting p_screen.")
+}
+
+# ---- 4. Global model and admissible subsets ----------------------------------
+cor_mat <- cor(dat[, sel_vars, drop = FALSE])
+
+cat("\n==== CORRELATION AMONG RETAINED PREDICTORS ====\n")
+print(round(cor_mat, 2))
+hp <- which(abs(cor_mat) > r_max & upper.tri(cor_mat), arr.ind = TRUE)
+if (nrow(hp)) {
+  cat("Pairs with |r| >", r_max, "(never combined):\n")
+  print(data.frame(var1 = rownames(cor_mat)[hp[, 1]],
+                   var2 = colnames(cor_mat)[hp[, 2]],
+                   r    = round(cor_mat[hp], 2)))
+}
+
+# Global model (all retained predictors), reported for completeness
+global <- fit_ob(sel_vars)
+cat("\nGlobal model converged cleanly:", is_ok(global), "\n")
+if (is_ok(global)) print(summary(global))
+
+max_terms <- min(length(sel_vars), max(1, floor(nrow(dat) / obs_per_term)))
+
+is_admissible <- function(vars) {
+  if (length(vars) < 2) return(TRUE)
+  cm <- abs(cor_mat[vars, vars])
+  if (any(cm[upper.tri(cm)] > r_max)) return(FALSE)
+  # CWB = Prec - Eto: never allow all three together
+  !all(c("Prec", "Eto", "CWB") %in% base_of(vars))
+}
+
+combos <- c(list(character(0)),
+            unlist(lapply(seq_len(max_terms),
+                          function(k) combn(sel_vars, k, simplify = FALSE)),
+                   recursive = FALSE))
+combos <- combos[map_lgl(combos, is_admissible)]
+cat("\nAdmissible subsets to fit:", length(combos), "(max terms =", max_terms, ")\n")
+
+subset_models <- map(combos, fit_ob)
+
+subset_tab <- tibble(
+  model_id  = seq_along(combos),
+  terms     = map_chr(combos, ~ if (length(.x)) paste(.x, collapse = " + ") else "(null)"),
+  k_terms   = lengths(combos),
+  converged = map_lgl(subset_models, is_ok),
+  AICc      = map_dbl(subset_models, get_aicc)
+) %>%
+  filter(converged) %>%
+  arrange(AICc) %>%
+  mutate(delta  = AICc - min(AICc),
+         weight = exp(-0.5 * delta) / sum(exp(-0.5 * delta)))
+
+cat("\n==== MODEL RANKING (top 15) ====\n")
+print(head(subset_tab, 15))
+
+# ---- 5. Diagnostics ----------------------------------------------------------
+diagnose <- function(m) {
+  res <- simulateResiduals(m, n = n_sim, seed = 123)
+
+  p_unif <- testUniformity(res, plot = FALSE)$p.value
+  p_disp <- testDispersion(res, plot = FALSE)$p.value
+  p_out  <- testOutliers(res, type = "bootstrap", plot = FALSE)$p.value
+  p_zero <- testZeroInflation(res, plot = FALSE)$p.value
+
+  # Temporal autocorrelation tested within each site, Holm-adjusted
+  p_ac <- sapply(levels(droplevels(dat$Site)), function(s) {
+    idx <- dat$Site == s
+    r_s <- recalculateResiduals(res, sel = idx)
+    testTemporalAutocorrelation(r_s, time = dat$Year[idx], plot = FALSE)$p.value
+  })
+  p_ac_adj <- p.adjust(p_ac, method = "holm")
+
+  k <- length(fixef(m)$cond) - 1
+  vif_max <- if (k >= 2) {
+    tryCatch(max(check_collinearity(m, component = "conditional")$VIF),
+             error = function(e) NA_real_)
+  } else NA_real_
+
+  singular <- if (use_site_re) {
+    tryCatch(check_singularity(m), error = function(e) NA)
+  } else FALSE
+
+  tibble(p_uniformity = p_unif, p_dispersion = p_disp,
+         p_outliers = p_out, p_zeroinfl = p_zero,
+         min_p_autocorr_holm = min(p_ac_adj),
+         sites_autocorr = paste(names(p_ac_adj)[p_ac_adj < alpha_diag], collapse = ", "),
+         VIF_max = vif_max, singular = singular)
+}
+
+cand <- subset_tab %>%
+  filter(delta <= delta_cand) %>%
+  slice_head(n = max_cand)
+
+diag_tab <- cand %>%
+  mutate(diag = map(model_id, ~ diagnose(subset_models[[.x]]))) %>%
+  unnest(diag) %>%
+  mutate(r2 = map(model_id, ~ get_r2(subset_models[[.x]]))) %>%
+  unnest(r2) %>%
+  mutate(pass = p_uniformity > alpha_diag &
+                p_dispersion > alpha_diag &
+                p_outliers   > alpha_diag &
+                p_zeroinfl   > alpha_diag &
+                min_p_autocorr_holm > alpha_diag &
+                (is.na(VIF_max) | VIF_max < 5) &
+                !(singular %in% TRUE))
+
+cat("\n==== DIAGNOSTICS OF CANDIDATE MODELS ====\n")
+print(diag_tab %>% select(terms, k_terms, delta, weight, p_uniformity, p_dispersion,
+                          p_outliers, p_zeroinfl, min_p_autocorr_holm,
+                          sites_autocorr, VIF_max, singular, R2_marginal, R2_conditional, pass),
+      width = Inf)
+
+# ---- 6. Final model ----------------------------------------------------------
+# The null model is a benchmark, not a candidate for the final model
+passing <- diag_tab %>% filter(pass, k_terms > 0)
+
+if (nrow(passing) == 0) {
+  warning("No predictor model passed all diagnostics. Top-ranked predictor model used; inspect before reporting.")
+  final_row <- diag_tab %>% filter(k_terms > 0) %>% slice(1)
+} else {
+  best_pass <- min(passing$AICc)
+  final_row <- passing %>%
+    filter(AICc - best_pass <= delta_pref) %>%
+    arrange(k_terms, AICc) %>%
+    slice(1)
+}
+
+final      <- subset_models[[final_row$model_id]]
+final_vars <- combos[[final_row$model_id]]
+
+cat("\n==== FINAL MODEL ====\n")
+cat("Window:", chosen_window, "\nTerms:", final_row$terms, "\n")
+null_row <- subset_tab %>% filter(k_terms == 0)
+cat("dAICc vs null:", round(final_row$AICc - null_row$AICc, 2),
+    "| Akaike weight final:", round(final_row$weight, 3),
+    "| null:", round(null_row$weight, 3), "\n")
+if (final_row$AICc - null_row$AICc > -2)
+  cat("NOTE: final model is within 2 AICc of the null; evidence for climate effects is weak.\n")
+print(summary(final))
+ci <- tryCatch(confint(final), error = function(e) NULL)
+if (!is.null(ci)) print(ci)
+r2 <- tryCatch(r2(final), error = function(e) "R2 not available for this family")
+print(r2)
+
+# DHARMa plot for final model
+res_final <- simulateResiduals(final, n = n_sim, seed = 123)
+pdf(file.path(out_dir, paste0(model_tag, "_DHARMa_final.pdf")), width = 10, height = 5)
+plot(res_final)
+dev.off()
+
+# ---- Export ------------------------------------------------------------------
+write.csv(single_tab,  file.path(out_dir, paste0(model_tag, "_01_single_models.csv")), row.names = FALSE)
+write.csv(window_tab,  file.path(out_dir, paste0(model_tag, "_02_window_selection.csv")), row.names = FALSE)
+write.csv(screen_tab,  file.path(out_dir, paste0(model_tag, "_03_screening.csv")), row.names = FALSE)
+write.csv(round(cor_mat, 3), file.path(out_dir, paste0(model_tag, "_04_correlation.csv")))
+write.csv(subset_tab,  file.path(out_dir, paste0(model_tag, "_05_model_ranking.csv")), row.names = FALSE)
+write.csv(diag_tab,    file.path(out_dir, paste0(model_tag, "_06_diagnostics.csv")), row.names = FALSE)
+write.csv(diag_tab %>% filter(pass) %>%
+            select(model_id, terms, k_terms, AICc, delta, weight,
+                   R2_marginal, R2_conditional, everything()),
+          file.path(out_dir, paste0(model_tag, "_06b_passing_models_R2.csv")), row.names = FALSE)
+
+library(broom.mixed)
+
+# ---- 6c. Coefficients and 95% CIs for the exported (passing) models ----------
+# One row per term per model. Predictors are standardised, so each estimate is
+# the change in the logit of mortality per 1 SD change in that predictor.
+coef_one <- function(id) {
+  m <- subset_models[[id]]
+  if (!is_ok(m)) return(NULL)
+  tt <- tryCatch(
+    broom.mixed::tidy(m, effects = "fixed", conf.int = TRUE, conf.level = 0.95),
+    error = function(e) NULL
+  )
+  if (is.null(tt)) return(NULL)
+  if ("component" %in% names(tt)) tt <- tt[tt$component == "cond", , drop = FALSE]
+  
+  # 90% intervals, matching the p < 0.1 marker used at the screening stage
+  tt90 <- tryCatch(
+    broom.mixed::tidy(m, effects = "fixed", conf.int = TRUE, conf.level = 0.90),
+    error = function(e) NULL
+  )
+  tt$conf.low90  <- NA_real_
+  tt$conf.high90 <- NA_real_
+  if (!is.null(tt90)) {
+    if ("component" %in% names(tt90)) tt90 <- tt90[tt90$component == "cond", , drop = FALSE]
+    idx <- match(tt$term, tt90$term)
+    tt$conf.low90  <- tt90$conf.low[idx]
+    tt$conf.high90 <- tt90$conf.high[idx]
+  }
+  vars <- combos[[id]]
+  lab  <- "(null)"
+  if (length(vars) > 0) lab <- paste(vars, collapse = " + ")
+  tt$model_id <- id
+  tt$terms    <- lab
+  tt$k_terms  <- length(vars)
+  tt
+}
+
+coef_ids <- diag_tab$model_id[diag_tab$pass & diag_tab$k_terms > 0]
+coef_tab <- bind_rows(map(coef_ids, coef_one))
+
+if (nrow(coef_tab) > 0) {
+  coef_tab <- coef_tab %>%
+    mutate(is_final     = model_id == final_row$model_id,
+           odds_ratio   = exp(estimate),
+           OR_conf.low  = exp(conf.low),
+           OR_conf.high = exp(conf.high),
+           sig_95       = conf.low > 0 | conf.high < 0,
+           sig_90       = conf.low90 > 0 | conf.high90 < 0) %>%
+    select(model_id, terms, k_terms, is_final, term, estimate, std.error,
+           conf.low, conf.high, conf.low90, conf.high90, statistic, p.value,
+           odds_ratio, OR_conf.low, OR_conf.high, sig_95, sig_90) %>%
+    arrange(desc(is_final), k_terms, model_id, term)
+  
+  cat("\n==== COEFFICIENTS AND 95% CIs (passing models with >= 1 predictor) ====\n")
+  print(coef_tab, n = Inf, width = Inf)
+  
+  write.csv(coef_tab,
+            file.path(out_dir, paste0(model_tag, "_06c_coefficients_CI.csv")),
+            row.names = FALSE)
+} else {
+  cat("\nNo passing model with predictors, so no coefficient table was written.\n")
+}
+
+capture.output(
+  { cat("Window:", chosen_window, "\nTerms:", final_row$terms,
+        "\ndAICc vs null:", round(final_row$AICc - null_row$AICc, 2), "\n\n")
+    print(summary(final)); if (!is.null(ci)) print(ci); print(r2) },
+  file = file.path(out_dir, paste0(model_tag, "_07_final_model.txt"))
+)
+
+# Structure saved so the simulated-mortality script can refit the same model
+saveRDS(list(response = response, window = chosen_window,
+             vars = final_vars, formula = make_fml(final_vars),
+             site_re = use_site_re),
+        file.path(out_dir, paste0(model_tag, "_final_structure.rds")))
+
+cat("\nOutputs written to:", out_dir, "\n")
